@@ -32,6 +32,7 @@ from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.helpers import ensure_directory
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+from .endpoint_names import canonical_endpoints
 
 
 class CSVExporter:
@@ -315,7 +316,10 @@ class CSVExporter:
 
         This method normalizes relationship data to a consistent format and exports
         to CSV. Handles various relationship field name variations and serializes
-        metadata as JSON strings.
+        metadata as JSON strings. The ends of a relationship are read from
+        ``source_id``/``source`` and ``target_id``/``target``, or from the names
+        graph backends use, ``start_node_id``/``end_node_id`` and
+        ``start_id``/``end_id`` (see ``endpoint_names``).
 
         Normalized Fields:
             - id: Relationship identifier
@@ -346,6 +350,10 @@ class CSVExporter:
             )
 
         self.logger.debug(f"Exporting {len(relationships)} relationship(s) to CSV")
+
+        # Backend-shaped records name the ends start_node_id/end_node_id (or
+        # start_id/end_id); bring them under source_id/target_id first.
+        relationships = canonical_endpoints(relationships)
 
         # Normalize relationship data to consistent format
         normalized_rels = []
