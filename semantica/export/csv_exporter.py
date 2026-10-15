@@ -32,7 +32,20 @@ from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.helpers import ensure_directory
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
-from .endpoint_names import canonical_endpoints
+from .endpoint_names import SOURCE_ENDPOINT_NAMES, TARGET_ENDPOINT_NAMES
+
+
+def _first_endpoint(record: Dict[str, Any], names: Any) -> Any:
+    """First endpoint value under ``names`` that is set, or ``""``.
+
+    ``None`` and ``""`` count as unset, so an empty ``source_id`` defers to
+    ``source`` and then to the backend spellings. ``0`` is a real id.
+    """
+    for name in names:
+        value = record.get(name)
+        if value is not None and value != "":
+            return value
+    return ""
 
 
 class CSVExporter:
@@ -351,10 +364,6 @@ class CSVExporter:
 
         self.logger.debug(f"Exporting {len(relationships)} relationship(s) to CSV")
 
-        # Backend-shaped records name the ends start_node_id/end_node_id (or
-        # start_id/end_id); bring them under source_id/target_id first.
-        relationships = canonical_endpoints(relationships)
-
         # Normalize relationship data to consistent format
         normalized_rels = []
         for i, rel in enumerate(relationships):
@@ -364,8 +373,8 @@ class CSVExporter:
 
             normalized = {
                 "id": rel.get("id", ""),
-                "source_id": rel.get("source_id") or rel.get("source", ""),
-                "target_id": rel.get("target_id") or rel.get("target", ""),
+                "source_id": _first_endpoint(rel, SOURCE_ENDPOINT_NAMES),
+                "target_id": _first_endpoint(rel, TARGET_ENDPOINT_NAMES),
                 "type": rel.get("type") or rel.get("relationship_type", ""),
                 "confidence": rel.get("confidence", ""),
             }

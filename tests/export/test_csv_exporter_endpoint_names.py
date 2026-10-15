@@ -110,6 +110,62 @@ def test_empty_source_id_still_falls_back_to_source(tmp_path):
     assert rows[0]["target_id"] == "acme"
 
 
+@pytest.mark.parametrize(
+    ("record", "source", "target"),
+    [
+        (
+            {
+                "source_id": "",
+                "start_node_id": "alice",
+                "target_id": "",
+                "end_node_id": "acme",
+            },
+            "alice",
+            "acme",
+        ),
+        (
+            {
+                "source_id": "",
+                "source": "",
+                "start_id": "alice",
+                "target": "",
+                "end_id": "acme",
+            },
+            "alice",
+            "acme",
+        ),
+        (
+            {
+                "source_id": None,
+                "start_node_id": "alice",
+                "target_id": None,
+                "end_node_id": "acme",
+            },
+            "alice",
+            "acme",
+        ),
+    ],
+)
+def test_empty_earlier_spelling_still_reaches_a_backend_alias(
+    tmp_path, record, source, target
+):
+    """An empty canonical value or alias must not hide a populated backend alias."""
+    rows = _export(tmp_path, [{"id": "r1", **record}])
+
+    assert rows[0]["source_id"] == source
+    assert rows[0]["target_id"] == target
+
+
+def test_zero_is_a_real_backend_id(tmp_path):
+    """Neo4j node ids start at 0; a falsy id must not be written as empty."""
+    record = {"id": "r1", "start_node_id": 0, "end_node_id": 1}
+
+    rows = _export(tmp_path, [record])
+
+    assert rows[0]["source_id"] == "0"
+    assert rows[0]["target_id"] == "1"
+
+
 def test_numeric_backend_ids_are_written(tmp_path):
     """Neo4j, FalkorDB and AGE return integer ids."""
     record = {"id": 7, "start_node_id": 1, "end_node_id": 2, "type": "KNOWS"}
