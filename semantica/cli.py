@@ -59,10 +59,15 @@ if TYPE_CHECKING:
     from .core.orchestrator import Semantica
 
 console = Console()
+# --json reserves stdout for the machine-readable payload, so warnings go
+# here instead. See the --json promise in the CLI context setup below.
+err_console = Console(stderr=True)
 
-# Supported interpreter range: ``requires-python = ">=3.10,<3.14"`` in
+# Supported interpreter range: ``requires-python = ">=3.11,<3.14"`` in
 # pyproject.toml. tests/test_python_support_policy.py fails if the two drift.
-MIN_PYTHON = (3, 10)
+# 3.10 was dropped in 0.8.0: it is past end of life and Pillow 13, which has
+# the security fixes 12.x lacks, needs 3.11 (#2067).
+MIN_PYTHON = (3, 11)
 MAX_PYTHON_EXCLUSIVE = (3, 14)
 
 
@@ -656,8 +661,9 @@ def main(
         # Reinitialize the module-level console if --no-color was requested so
         # all subsequent console.print() calls in this invocation respect the flag.
         if no_color:
-            global console  # noqa: PLW0603
+            global console, err_console  # noqa: PLW0603
             console = Console(no_color=True)
+            err_console = Console(stderr=True, no_color=True)
         ctx.obj = CLIContext(
             config_path=_resolve_config_path(config_path),
             config=config,
@@ -1757,7 +1763,10 @@ def _info(cli_ctx: CLIContext, text: str) -> None:
 
 
 def _warn(cli_ctx: CLIContext, text: str) -> None:
-    console.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
+    # Under --json the payload owns stdout, so the warning goes to stderr and
+    # the output stays one parseable document.
+    stream = err_console if cli_ctx.json_output else console
+    stream.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
 
 
 def _dry(cli_ctx: CLIContext, action: str, *, json_out: bool = False, **fields: Any) -> None:
@@ -5477,9 +5486,9 @@ def _collect_backup_sources(
 ) -> Tuple[List[Tuple[str, Path]], List[Dict[str, str]]]:
     """Return (arcname, local_path) pairs for local files to include in a backup.
 
-    Also returns each configured store whose local path does not exist, so the
-    caller can report it instead of writing a partial archive with no sign that
-    a store was dropped (#2009).
+    Also returns each configured store whose local path does not exist or holds
+    no files, so the caller can report it instead of writing a partial archive
+    with no sign that a store was dropped (#2009, #2014).
     """
     sources: List[Tuple[str, Path]] = []
     skipped: List[Dict[str, str]] = []
@@ -5498,11 +5507,26 @@ def _collect_backup_sources(
         if ont_path:
             p = Path(ont_path)
             if p.is_dir():
+                before = len(sources)
                 for f in p.rglob("*"):
                     if f.is_file():
                         sources.append((f"ontology/{f.relative_to(p)}", f))
+                if len(sources) == before:
+                    # An existing-but-empty directory contributed nothing; report
+                    # it instead of dropping it silently (#2014).
+                    skipped.append({
+                        "store": "ontology",
+                        "backend": "file",
+                        "path": _redact(ont_path),
+                    })
             elif p.is_file():
                 sources.append((f"ontology/{p.name}", p))
+            else:
+                skipped.append({
+                    "store": "ontology",
+                    "backend": "file",
+                    "path": _redact(ont_path),
+                })
 
     store_map = {"graph": "graph_db", "vector": "vector_store", "triplet": "triplet_store"}
     for store_type, cfg_key in store_map.items():
@@ -5520,9 +5544,19 @@ def _collect_backup_sources(
             continue
         p = Path(data_path)
         if p.is_dir():
+            before = len(sources)
             for f in p.rglob("*"):
                 if f.is_file():
                     sources.append((f"{store_type}/{f.relative_to(p)}", f))
+            if len(sources) == before:
+                # Same reporting rule as a missing path: an empty directory
+                # yields no files, so the store would vanish from the archive
+                # with no sign of it (#2014).
+                skipped.append({
+                    "store": store_type,
+                    "backend": str(info.get("backend", "unknown")),
+                    "path": _redact(data_path),
+                })
         elif p.is_file():
             sources.append((f"{store_type}/{p.name}", p))
         else:
@@ -5535,6 +5569,54 @@ def _collect_backup_sources(
             })
 
     return sources, skipped
+
+
+def _skip_label(store: str) -> str:
+    """Human label for a skipped entry, without calling ontology a 'store'."""
+    return "ontology" if store == "ontology" else f"{store} store"
+
+
+def _warn_skipped(cli_ctx: CLIContext, skipped: List[Dict[str, str]]) -> None:
+    """Name every configured path that contributed no files (#2009, #2014)."""
+    for entry in skipped:
+        _warn(
+            cli_ctx,
+            f"Skipping {_skip_label(entry['store'])} ({entry['backend']}): "
+            f"path does not exist or contains no files: {entry['path']}",
+        )
+
+
+def _raise_on_no_store_data(sources: List[Tuple[str, Path]], include: str) -> None:
+    """Refuse a backup that would hold no store data at all (#1820).
+
+    Called by the real command and by its dry run alike: a preview that
+    reports success for an archive the real command refuses to write is the
+    same surprise as a successful backup with nothing in it (#2122).
+    """
+    if include not in ("graph", "vector", "triplet", "all"):
+        return
+    if any(arcname.startswith(("graph/", "vector/", "triplet/"))
+           for arcname, _ in sources):
+        return
+    stores = "graph, vector and triplet stores" if include == "all" else f"{include} store"
+    raise click.ClickException(
+        f"No store data to back up: found no local files for the {stores}. "
+        "backup create only copies file-based stores (a graph_db / vector_store / "
+        "triplet_store path that exists on disk); run `semantica backup info` "
+        "to see how to back up other backends."
+    )
+
+
+def _raise_on_skipped(skipped: List[Dict[str, str]], *, target: str) -> None:
+    """Raise the --fail-on-skip error naming every skipped path."""
+    if not skipped:
+        return
+    missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
+    raise click.ClickException(
+        f"Configured store path does not exist or contains no files: {missing}. "
+        f"Nothing from those stores would be {target}; create the path, drop it "
+        "from the config, or omit --fail-on-skip to continue with the rest."
+    )
 
 
 def _redact(uri: str) -> str:
@@ -5603,7 +5685,7 @@ def backup_info(cli_ctx: CLIContext, local_json: bool) -> None:
 @click.option("--strip-config", is_flag=True, default=False,
               help="Exclude semantica.yaml to avoid storing credentials at rest.")
 @click.option("--fail-on-skip", is_flag=True, default=False,
-              help="Exit non-zero when a configured store path does not exist.")
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
@@ -5623,7 +5705,24 @@ def backup_create(
 
     def _action() -> None:
         if _is_dry(cli_ctx, local_dry):
-            _dry(cli_ctx, "backup create", destination=destination, include=include)
+            # A dry run is a preview of the real command, so it has to report
+            # the same skipped stores, honour --fail-on-skip and refuse an
+            # archive the real run would not write (#2109, #2122).
+            cfg = cli_ctx.config.to_dict()
+            sources, skipped = _collect_backup_sources(
+                cfg, cli_ctx.config_path, include, strip_config,
+            )
+            _warn_skipped(cli_ctx, skipped)
+            _raise_on_no_store_data(sources, include)
+            if fail_on_skip:
+                _raise_on_skipped(skipped, target="in the archive")
+            _dry(
+                cli_ctx,
+                "backup create",
+                destination=destination,
+                include=include,
+                skipped=skipped,
+            )
             return
 
         if keyfile:
@@ -5656,34 +5755,14 @@ def backup_create(
         # so a partial archive was reported as a success (#2009). Report every
         # one before the prompts, and before the empty-archive check below so
         # the missing paths are named even when no store is left to back up.
-        for entry in skipped:
-            _warn(
-                cli_ctx,
-                f"Skipping {entry['store']} store ({entry['backend']}): "
-                f"path does not exist: {entry['path']}",
-            )
+        _warn_skipped(cli_ctx, skipped)
 
         # Fail before any prompt instead of writing an archive with no
         # store data in it (#1820).
-        if include in ("graph", "vector", "triplet", "all") and not any(
-            arcname.startswith(("graph/", "vector/", "triplet/"))
-            for arcname, _ in sources
-        ):
-            stores = "graph, vector and triplet stores" if include == "all" else f"{include} store"
-            raise click.ClickException(
-                f"No store data to back up: found no local files for the {stores}. "
-                "backup create only copies file-based stores (a graph_db / vector_store / "
-                "triplet_store path that exists on disk); run `semantica backup info` "
-                "to see how to back up other backends."
-            )
+        _raise_on_no_store_data(sources, include)
 
-        if skipped and fail_on_skip:
-            missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
-            raise click.ClickException(
-                f"Configured store path does not exist: {missing}. Nothing from "
-                "those stores would be in the archive; create the path, drop it "
-                "from the config, or omit --fail-on-skip to back up the rest."
-            )
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="in the archive")
 
         if encrypt and passphrase is None:
             passphrase = click.prompt("Backup passphrase", hide_input=True,
@@ -5775,11 +5854,13 @@ def backup_create(
 @click.option("--include",
               type=click.Choice(["graph", "vector", "triplet", "config", "ontology", "all"]),
               default="all", show_default=True)
+@click.option("--fail-on-skip", is_flag=True, default=False,
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
 def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
-                local_dry: bool, local_quiet: bool) -> None:
+                fail_on_skip: bool, local_dry: bool, local_quiet: bool) -> None:
     """Incremental folder sync (idempotent, copies only changed files).
 
     \b
@@ -5793,12 +5874,17 @@ def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
         import shutil
         dest = Path(destination)
         cfg = cli_ctx.config.to_dict()
-        sources, _skipped = _collect_backup_sources(
+        sources, skipped = _collect_backup_sources(
             cfg, cli_ctx.config_path, include, strip_config=False,
         )
+        # A skipped store used to be discarded here, so a sync after a partial
+        # create reported success for an incomplete store set (#2014).
+        _warn_skipped(cli_ctx, skipped)
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="included in the sync")
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "sync backup", destination=str(dest), include=include,
-                 files=[a for a, _ in sources])
+                 files=[a for a, _ in sources], skipped=skipped)
             return
         dest.mkdir(parents=True, exist_ok=True)
         try:
